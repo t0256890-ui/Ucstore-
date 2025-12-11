@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Telegram shop bot — як файл
-Технология: pyTelegramBotAPI (telebot) + sqlite3
-Муаллиф: таҳриршуда барои дархости корбар
-Admin ID ва Instagram дар конфиг оварда шудаанд
+Telegram shop bot — як файл (pyTelegramBotAPI + sqlite3)
+Ислоҳшуда барои мушаххасоти корбар
 """
 
 import sqlite3
@@ -15,18 +13,17 @@ import time
 
 # ---------- Конфиг ----------
 BOT_TOKEN = "8394642029:AAH50ltfmxyRRBnPm3QTa3LAtx8MeDSqBU0"  # <- ИН ҶО ТОКЕНРО ГУЗОРЕД
-ADMIN_ID = 8436218638     # ID админ аз паёми шумо
+ADMIN_ID = 5808918857     # ID админ
 ADMIN_INSTAGRAM = "https://www.instagram.com/garant_alestr?igsh=cTE4bnA3NW5ycHFs"
 DB_FILE = "bot.db"
 
 # ---------- Созмондиҳӣ ----------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
 
-# Соҳиби базаи дода ва инит
+# ---------- Database init ----------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # users: id, tg_id, phone, verified (0/1), first_name, last_name, username
     c.execute("""CREATE TABLE IF NOT EXISTS users (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  tg_id INTEGER UNIQUE,
@@ -36,7 +33,6 @@ def init_db():
                  last_name TEXT,
                  username TEXT
                  )""")
-    # products: id, category, code, title, price_tjs, diamonds (for voucher - number of diamonds), description
     c.execute("""CREATE TABLE IF NOT EXISTS products (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  category TEXT,
@@ -46,20 +42,17 @@ def init_db():
                  diamonds INTEGER,
                  description TEXT
                  )""")
-    # cart: id, tg_id, product_code, qty
     c.execute("""CREATE TABLE IF NOT EXISTS cart (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  tg_id INTEGER,
                  product_code TEXT,
                  qty INTEGER DEFAULT 1
                  )""")
-    # wishlist (dilkho): id, tg_id, product_code
     c.execute("""CREATE TABLE IF NOT EXISTS wishlist (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  tg_id INTEGER,
                  product_code TEXT
                  )""")
-    # orders: id, tg_id, order_data (text json-like), game_id, status, created_at, receipt_file_id
     c.execute("""CREATE TABLE IF NOT EXISTS orders (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  tg_id INTEGER,
@@ -71,10 +64,9 @@ def init_db():
                  )""")
     conn.commit()
 
-    # ИФОСОДАИ МАҲСУЛОТ (примитив) агар пешакӣ набошанд
+    # Insert default products if none
     c.execute("SELECT COUNT(*) FROM products")
     if c.fetchone()[0] == 0:
-        # diamonds
         diamonds = [
             ("diamond", "D100", "💎100+5", 10, 105, "100+5 diamonds"),
             ("diamond", "D310", "💎310+16", 28, 326, "310+16 diamonds"),
@@ -86,24 +78,20 @@ def init_db():
         for cat, code, title, price, diamonds_count, desc in diamonds:
             c.execute("INSERT INTO products (category, code, title, price_tjs, diamonds, description) VALUES (?, ?, ?, ?, ?, ?)",
                       (cat, code, title, price, diamonds_count, desc))
-        # vouchers
         vouchers = [
             ("voucher", "V_WEEK", "Неделю - 450💎-17 см", 0, 450, "1 week voucher: 450 diamonds - 17 см"),
             ("voucher", "V_MONTH", "Месяц - 2600💎-97 см", 0, 2600, "1 month voucher: 2600 diamonds - 97 см"),
             ("voucher", "V_LIGHT", "Лайт - 90💎-7 см", 0, 90, "Light voucher: 90 diamonds - 7 см"),
         ]
         for cat, code, title, price, diamonds_count, desc in vouchers:
-            # price_tjs вомехӯрем 0, зеро шумо нархҳо дар см надодаед - агар лозим, тағйир диҳед
             c.execute("INSERT INTO products (category, code, title, price_tjs, diamonds, description) VALUES (?, ?, ?, ?, ?, ?)",
                       (cat, code, title, price, diamonds_count, desc))
         conn.commit()
-
     conn.close()
 
 init_db()
 
-# ---------- Кушодани сессияҳои оддӣ дар хотира (барои state) ----------
-# Мап барои нигоҳ доштани ҳолатҳо (verification, expecting game id, admin broadcast, expect payment receipt)
+# ---------- In-memory states ----------
 user_state = {}  # tg_id -> {"step": "...", "expected": ..., "tmp": {...}}
 
 def set_state(tg_id, step, expected=None, tmp=None):
@@ -116,12 +104,11 @@ def clear_state(tg_id):
     if tg_id in user_state:
         del user_state[tg_id]
 
-# ---------- Компонентҳои клавиатура ----------
+# ---------- Keyboards ----------
 def main_menu_keyboard(tg_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row("🛒 Мағоза", "🧺 Сабад")
     markup.row("💖 Дилхоҳо", "ℹ️ Маълумот")
-    # профили админ барои ҳар кас нишон дода мешавад, аммо панели админ — фақат агар админ бошад онро имконият медиҳад
     markup.row("👤 Профили админ", "🛠️ Панели админ")
     return markup
 
@@ -134,7 +121,6 @@ def shop_menu_kb():
 
 def diamonds_kb():
     markup = types.InlineKeyboardMarkup(row_width=1)
-    # Чор-панҷ тугмаҳо дар ҳамон тартиб
     labels = [
         ("💎100+5 - 10 TJS", "D100"),
         ("💎310+16 - 28 TJS", "D310"),
@@ -174,7 +160,7 @@ def wishlist_item_kb(code):
     markup.add(types.InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_to_main"))
     return markup
 
-def cart_item_kb(code):
+def cart_item_kb():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🛍️ Фармоиш додан", callback_data="order_start"))
     markup.add(types.InlineKeyboardButton("🗑️ Пок кардан", callback_data="cart_clear"))
@@ -198,7 +184,7 @@ def admin_order_action_kb(order_id):
                types.InlineKeyboardButton("❌ Рад", callback_data=f"admin_reject:{order_id}"))
     return markup
 
-# ---------- Помощники DB ----------
+# ---------- DB helpers ----------
 def db_execute(query, params=(), fetch=False, many=False):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -220,7 +206,6 @@ def add_user_if_not_exists(tg_user):
     first = tg_user.first_name or ""
     last = tg_user.last_name or ""
     username = tg_user.username or ""
-    # phone may be set later
     existing = db_execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,), fetch=True)
     if not existing:
         db_execute("INSERT INTO users (tg_id, first_name, last_name, username) VALUES (?, ?, ?, ?)",
@@ -247,7 +232,6 @@ def get_product_by_code(code):
     return res[0] if res else None
 
 def add_to_cart_db(tg_id, product_code, qty=1):
-    # agar hozir hamon mahsuloti bo'lsa qty ++
     res = db_execute("SELECT id, qty FROM cart WHERE tg_id = ? AND product_code = ?", (tg_id, product_code), fetch=True)
     if res:
         cid, oldq = res[0]
@@ -266,7 +250,6 @@ def get_cart_items(tg_id):
     return res
 
 def add_to_wishlist_db(tg_id, product_code):
-    # prevent duplicates
     res = db_execute("SELECT id FROM wishlist WHERE tg_id = ? AND product_code = ?", (tg_id, product_code), fetch=True)
     if not res:
         db_execute("INSERT INTO wishlist (tg_id, product_code) VALUES (?, ?)", (tg_id, product_code))
@@ -302,13 +285,7 @@ def get_order(order_id):
 def get_all_users():
     return db_execute("SELECT tg_id, phone, verified, first_name, last_name, username FROM users", fetch=True)
 
-# ---------- Хелперы барои тексти паёмҳо ----------
-def format_product_line(code, title, price, diamonds):
-    if price:
-        return f"{title} — {price} TJS ({diamonds}💎)"
-    else:
-        return f"{title} — {diamonds}💎"
-
+# ---------- Message text helpers ----------
 def cart_summary_text(tg_id):
     items = get_cart_items(tg_id)
     if not items:
@@ -325,15 +302,15 @@ def cart_summary_text(tg_id):
     lines.append(f"\nҶамъ: {total} TJS")
     return "\n".join(lines)
 
-# ---------- Воридшавӣ ва санҷиш ----------
+# ---------- Handlers ----------
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     add_user_if_not_exists(message.from_user)
     tg_id = message.from_user.id
-    # Сохтани клавиатураи асосӣ ва пурсидани рақам
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     kb.add(types.KeyboardButton("📱 Фиристони рақам", request_contact=True))
-    kb.add("Ворид кардан бо рақам (фаришта)", "❌ Бекор")
+    kb.add("Ворид кардан бо рақам (фаришта)")
+    kb.add("❌ Бекор")
     bot.send_message(tg_id, "Салом! Лутфан рақами телефон ё рақамро ворид кунед. (Формат: танҳо рақамҳо, бе ҳарф)", reply_markup=kb)
     set_state(tg_id, "await_phone")
 
@@ -342,29 +319,23 @@ def handle_contact_or_text(message):
     tg_id = message.from_user.id
     state = get_state(tg_id)
     text = message.text or ""
-    # Агар contact фиристода бошад
+
     if message.content_type == 'contact':
         phone = message.contact.phone_number
         phone_digits = re.sub(r'\D', '', phone)
-        # мониторинг: phone digits
-        # set in db as not yet verified, pass to challenge
         set_user_phone(tg_id, phone_digits, verified=0)
-        # compute check: sum of digits + 7
         total = sum(int(d) for d in phone_digits) + 7
         expected = str(total)
         set_state(tg_id, "await_verification", expected=expected, tmp={"phone": phone_digits})
-        bot.send_message(tg_id, f"Барои амният, натиҷаи санҷиши хурдро ворид кунед: ҷамъ(ҳар рақам) + 7 = ?\n(Натиҷа танҳо рақам бошад)\nМасалан: агар телефон 992000111 тавр бошад, шумо +7 хоҳед илова кард.\nЛутфан танҳо рақамро ворид кунед.")
+        bot.send_message(tg_id, f"Барои амният, натиҷаи санҷиши хурдро ворид кунед: ҷамъ(ҳар рақам) + 7 = ?\n(Натиҷа танҳо рақам бошад)")
         return
 
-    # otherwise text flows
-    # If state awaiting phone
+    # state: await_phone
     if state['step'] == "await_phone":
-        # extract digits
         phone_digits = re.sub(r'\D', '', text)
         if not phone_digits:
             bot.send_message(tg_id, "Рақам ё контакт дохил нашуд. Лутфан танҳо рақам ворид кунед.")
             return
-        # basic length check (10-12 digits)
         if len(phone_digits) < 10 or len(phone_digits) > 12:
             bot.send_message(tg_id, "Рақами шумо бояд танҳо рақам бошад ва дарозӣ байни 10 ва 12 рақам бошад. Лутфан дубора ворид кунед.")
             return
@@ -375,18 +346,15 @@ def handle_contact_or_text(message):
         bot.send_message(tg_id, "Санҷиш: суммияи рақамҳо + 7 = ?\nЛутфан натиҷаро ҳамчун рақам ворид кунед.")
         return
 
-    # If awaiting verification
+    # state: await_verification
     if state['step'] == "await_verification":
         answer = re.sub(r'\D', '', text)
         if not answer:
             bot.send_message(tg_id, "Лутфан танҳо рақам ворид кунед (бе ҳарф).")
             return
         if answer == state['expected']:
-            # verified
             set_user_verified(tg_id, 1)
-            # add user details
             add_user_if_not_exists(message.from_user)
-            # send main menu
             bot.send_message(tg_id, "Шуморо тафтиш кардем — хуб! Хуш омадед ба менюи асосӣ.", reply_markup=main_menu_keyboard(tg_id))
             clear_state(tg_id)
             return
@@ -394,18 +362,15 @@ def handle_contact_or_text(message):
             bot.send_message(tg_id, "Натиҷаи санҷиш нодуруст. Лутфан дубора кӯшиш кунед ё бо занг/контакт фиристед.")
             return
 
-    # General text handling for main menu buttons
-    # Агар шахс "🛒 Мағоза"
+    # main menu text handlers
     if text == "🛒 Мағоза" or text.lower() == "мағоза":
-        bot.send_message(tg_id, "Мағоза — интихоб кунед:", reply_markup=None, reply_markup=None)
-        bot.send_message(tg_id, "Интихоб кунед:", reply_markup=shop_menu_kb())
+        bot.send_message(tg_id, "Мағоза — интихоб кунед:", reply_markup=shop_menu_kb())
         return
 
     if text == "🧺 Сабад" or text.lower() == "сабад":
-        # display cart items
         summary = cart_summary_text(tg_id)
-        bot.send_message(tg_id, f"Сабад:\n\n{summary}", reply_markup=None)
-        bot.send_message(tg_id, "Амалиётҳо:", reply_markup=cart_item_kb(None))
+        bot.send_message(tg_id, f"Сабад:\n\n{summary}", reply_markup=types.ReplyKeyboardRemove())
+        bot.send_message(tg_id, "Амалиётҳо:", reply_markup=cart_item_kb())
         return
 
     if text == "💖 Дилхоҳо" or text.lower() == "дилхоҳо":
@@ -413,7 +378,6 @@ def handle_contact_or_text(message):
         if not items:
             bot.send_message(tg_id, "Дилҳо холӣ аст.", reply_markup=main_menu_keyboard(tg_id))
             return
-        # list them one by one
         for (code,) in items:
             prod = get_product_by_code(code)
             if prod:
@@ -441,36 +405,42 @@ def handle_contact_or_text(message):
     # catch-all
     bot.send_message(tg_id, "Номуайян — лутфан менюеро интихоб кунед ё /start фишоред.", reply_markup=main_menu_keyboard(tg_id))
 
-# ---------- Callbacks (Inline buttons) ----------
+# ---------- Callbacks ----------
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     tg_id = call.from_user.id
     data = call.data
 
-    # Back to main
-    if data == "back_to_main" or data == "shop_menu_back":
-        bot.edit_message_text("Баргашт ба менюи асосӣ.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+    if data in ("back_to_main", "shop_menu_back"):
+        try:
+            bot.edit_message_text("Баргашт ба менюи асосӣ.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        except Exception:
+            pass
         bot.send_message(tg_id, "Менюи асосӣ:", reply_markup=main_menu_keyboard(tg_id))
         return
 
     if data == "shop_diamond":
-        bot.edit_message_text("Алмаз — интихоб кунед:", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        try:
+            bot.edit_message_text("Алмаз — интихоб кунед:", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        except Exception:
+            pass
         bot.send_message(tg_id, "Пакетҳоро интихоб кунед:", reply_markup=diamonds_kb())
         return
 
     if data == "shop_voucher":
-        bot.edit_message_text("Воучер — интихоб кунед:", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        try:
+            bot.edit_message_text("Воучер — интихоб кунед:", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        except Exception:
+            pass
         bot.send_message(tg_id, "Воучерҳоро интихоб кунед:", reply_markup=vouchers_kb())
         return
 
-    # product selected
     if data.startswith("prod_select:"):
         code = data.split(":", 1)[1]
         prod = get_product_by_code(code)
         if prod:
             _, title, price_tjs, diamonds, desc = prod
             txt = f"{title}\n{desc}\n\nНарх: {price_tjs} TJS\n{diamonds}💎"
-            # edit message and show action buttons
             try:
                 bot.edit_message_text(txt, chat_id=call.message.chat.id, message_id=call.message.message_id)
             except Exception:
@@ -480,7 +450,6 @@ def callback_query(call):
             bot.answer_callback_query(call.id, "Маҳсулот ёфт нашуд.")
         return
 
-    # add to cart
     if data.startswith("add_cart:"):
         code = data.split(":", 1)[1]
         add_to_cart_db(tg_id, code)
@@ -488,7 +457,6 @@ def callback_query(call):
         bot.send_message(tg_id, "Маҳсулот ба сабад илова шуд.", reply_markup=main_menu_keyboard(tg_id))
         return
 
-    # add to wishlist
     if data.startswith("add_wish:"):
         code = data.split(":", 1)[1]
         add_to_wishlist_db(tg_id, code)
@@ -496,7 +464,6 @@ def callback_query(call):
         bot.send_message(tg_id, "Маҳсулот ба дилхоҳо илова шуд.", reply_markup=main_menu_keyboard(tg_id))
         return
 
-    # wish to cart
     if data.startswith("wish_to_cart:"):
         code = data.split(":", 1)[1]
         add_to_cart_db(tg_id, code)
@@ -505,7 +472,6 @@ def callback_query(call):
         bot.send_message(tg_id, "Аз дилхоҳо ба сабад илова шуд.", reply_markup=main_menu_keyboard(tg_id))
         return
 
-    # wish clear item
     if data.startswith("wish_clear_item:"):
         code = data.split(":", 1)[1]
         remove_from_wishlist_db(tg_id, code)
@@ -513,16 +479,13 @@ def callback_query(call):
         bot.send_message(tg_id, "Маҳсулот аз дилхоҳо пок карда шуд.", reply_markup=main_menu_keyboard(tg_id))
         return
 
-    # cart clear
     if data == "cart_clear":
         remove_from_cart_db(tg_id)
         bot.answer_callback_query(call.id, "Сабад пок шуд.")
         bot.send_message(tg_id, "Сабад пок карда шуд.", reply_markup=main_menu_keyboard(tg_id))
         return
 
-    # start order
     if data == "order_start":
-        # check cart non empty
         items = get_cart_items(tg_id)
         if not items:
             bot.answer_callback_query(call.id, "Сабад холӣ аст.")
@@ -532,7 +495,6 @@ def callback_query(call):
         bot.send_message(tg_id, "Лутфан ID-и бозиро ворид кунед (танҳо рақам; 10-12 рақам):", reply_markup=types.ReplyKeyboardRemove())
         return
 
-    # admin panel actions
     if data == "admin_users":
         if tg_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "Фақат админ.")
@@ -568,47 +530,39 @@ def callback_query(call):
         bot.send_message(tg_id, "Лутфан матни паём барои фиристодан ба ҳамаи корбаронро нависед.")
         return
 
-    # admin accept / reject
-    if data.startswith("admin_accept:") or data.startswith("admin_reject:"):
+    if data.startswith("admin_accept:"):
         if tg_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "Фақат админ.")
             return
-        parts = data.split(":", 1)
-        action = parts[0].split("_")[1]  # accept or reject? careful
-        # better parse full
-        if data.startswith("admin_accept:"):
-            oid = int(parts[1])
-            order = get_order(oid)
-            if not order:
-                bot.answer_callback_query(call.id, "Order not found.")
-                return
-            # notify user
-            user_tg = order[1]
-            set_order_status(oid, "accepted")
-            bot.send_message(user_tg, "✅ Маълумот: маҳсулот ба ҳисоби шумо фиристода шуд.")
-            bot.answer_callback_query(call.id, f"Order #{oid} қабул шуд.")
+        oid = int(data.split(":",1)[1])
+        order = get_order(oid)
+        if not order:
+            bot.answer_callback_query(call.id, "Order not found.")
             return
-        else:
-            oid = int(parts[1])
-            order = get_order(oid)
-            if not order:
-                bot.answer_callback_query(call.id, "Order not found.")
-                return
-            user_tg = order[1]
-            set_order_status(oid, "rejected")
-            bot.send_message(user_tg, "❌ Фармоиш рад карда шуд. Пардохт анҷом дода нашудааст. Агар мушкилӣ буд, ба админ муроҷиат кунед.")
-            bot.answer_callback_query(call.id, f"Order #{oid} рад карда шуд.")
-            return
-
-    # order accept/reject for inline forwarded receipts: pattern admin_accept:{order_id}
-    if data.startswith("admin_accept:"):
-        # handled above
+        user_tg = order[1]
+        set_order_status(oid, "accepted")
+        bot.send_message(user_tg, "✅ Маълумот: маҳсулот ба ҳисоби шумо фиристода шуд.")
+        bot.answer_callback_query(call.id, f"Order #{oid} қабул шуд.")
         return
 
-    # default
-    bot.answer_callback_query(call.id, "Амалиёт иҷро кардем.")
+    if data.startswith("admin_reject:"):
+        if tg_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Фақат админ.")
+            return
+        oid = int(data.split(":",1)[1])
+        order = get_order(oid)
+        if not order:
+            bot.answer_callback_query(call.id, "Order not found.")
+            return
+        user_tg = order[1]
+        set_order_status(oid, "rejected")
+        bot.send_message(user_tg, "❌ Фармоиш рад карда шуд. Пардохт анҷом дода нашудааст. Агар мушкилот пеш омада бошад ба админ тамос гиред.")
+        bot.answer_callback_query(call.id, f"Order #{oid} рад карда шуд.")
+        return
 
-# ---------- Муошират барои интиқоли ID бозӣ ва пардохт ----------
+    bot.answer_callback_query(call.id, "Амалиёт иҷро шуд.")
+
+# ---------- Game ID / Order flow ----------
 @bot.message_handler(func=lambda m: get_state(m.from_user.id)['step'] == "await_game_id", content_types=['text'])
 def handle_game_id(message):
     tg_id = message.from_user.id
@@ -620,9 +574,11 @@ def handle_game_id(message):
     if len(digits) < 10 or len(digits) > 12:
         bot.send_message(tg_id, "ID бояд 10-12 рақам дошта бошад. Лутфан дубора ворид кунед.")
         return
-    st = get_state(tg_id)
-    # Create order: build order text from cart
     cart_items = get_cart_items(tg_id)
+    if not cart_items:
+        bot.send_message(tg_id, "Сабад холӣ аст.")
+        clear_state(tg_id)
+        return
     lines = []
     total = 0
     for code, qty in cart_items:
@@ -633,20 +589,17 @@ def handle_game_id(message):
             total += (price_tjs if price_tjs else 0) * qty
     order_text = ";\n".join(lines) + f"\nTotal: {total} TJS"
     order_id = create_order_db(tg_id, order_text, digits)
-    # clear cart
     remove_from_cart_db(tg_id)
     clear_state(tg_id)
-    # Ask for payment: show card number and ask for screenshot/file
+    set_state(tg_id, "await_receipt", tmp={"order_id": order_id})
     pay_msg = ("Лутфан барои пардохт маблағро ба рақами корт: <b>577726627</b> пардохт кунед.\n"
                "Баъд аз пардохт як скриншот ё файлро ҳамчун квитансия фиристед.\n"
-               f"Order ID: {order_id}\nGame ID: {digits}\nСомонаи пардохт: (инҷо) ")
-    # set state to expect receipt and store order id
-    set_state(tg_id, "await_receipt", tmp={"order_id": order_id})
+               f"Order ID: {order_id}\nGame ID: {digits}")
     bot.send_message(tg_id, pay_msg)
     bot.send_message(tg_id, "Ҳоло лутфан файл ё расм (скриншот) барои квитансия фиристед.")
     return
 
-# Handle receipt files (photo/document)
+# ---------- Handle receipt ----------
 @bot.message_handler(content_types=['photo', 'document'])
 def handle_receipt(message):
     tg_id = message.from_user.id
@@ -660,24 +613,19 @@ def handle_receipt(message):
         clear_state(tg_id)
         return
     file_id = None
-    caption = None
     if message.content_type == 'photo':
-        # get largest photo
         file_id = message.photo[-1].file_id
-    else:  # document
+    else:
         file_id = message.document.file_id
-    # Store file id to order
     set_order_receipt(order_id, file_id)
     set_order_status(order_id, "waiting_admin")
     clear_state(tg_id)
-    # Forward the receipt to admin with order info
     order = get_order(order_id)
     if order:
         oid, user_tg, order_text, game_id, status, created_at, receipt = order
         u = get_user_by_tg(user_tg)
         phone = u['phone'] if u else '-'
         profile_info = f"User: {user_tg}\nPhone: {phone}\nOrder: #{oid}\nGame ID: {game_id}\n\n{order_text}"
-        # send to admin with inline accept/reject
         if message.content_type == 'photo':
             bot.send_photo(ADMIN_ID, file_id, caption=profile_info, reply_markup=admin_order_action_kb(oid))
         else:
@@ -687,7 +635,7 @@ def handle_receipt(message):
         bot.send_message(tg_id, "Хатогӣ дар эҷоди фармоиш. Лутфан бо админ тамос гиред.")
     return
 
-# ---------- Admin broadcast handling ----------
+# ---------- Admin broadcast ----------
 @bot.message_handler(func=lambda m: get_state(m.from_user.id)['step'] == "admin_broadcast_prepare", content_types=['text', 'photo', 'document'])
 def handle_admin_broadcast(message):
     tg_id = message.from_user.id
@@ -695,14 +643,12 @@ def handle_admin_broadcast(message):
         bot.send_message(tg_id, "Фақат админ.")
         clear_state(tg_id)
         return
-    # broadcast message to all users
     users = get_all_users()
     successes = 0
     fails = 0
     for u in users:
         user_tg = u[0]
         try:
-            # if message is text, send text; if media, forward original
             if message.content_type == 'text':
                 bot.send_message(user_tg, f"Админ: {message.text}")
             elif message.content_type == 'photo':
@@ -717,10 +663,8 @@ def handle_admin_broadcast(message):
     clear_state(tg_id)
     return
 
-# ---------- Utility: print message on startup ----------
 print("Bot is running...")
 
-# ---------- Запуск бота ----------
 if __name__ == "__main__":
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
