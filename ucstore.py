@@ -1,716 +1,1115 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Telegram shop bot — пурра:
-- Python + python-telegram-bot v20+
-- SQLite барои нигоҳдорӣ (файли local: bot_data.db)
-- Администратор: 5808918857 (аз шумо гирифта шудааст)
-- Instagram админ дар профил нишон дода мешавад
-"""
-
-import logging
-import sqlite3
-import random
-import time
-from datetime import datetime
+# UCstore.py — Full version (async, python-telegram-bot v20+)
+# NOTE: Replace TOKEN with your bot token before running.
 
 from telegram import (
-    __version__ as pg_version,
     Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
     CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import datetime
+import json
+import os
+import random
+import string
+
+# -------------------- Config --------------------
+TOKEN = "8524676045:AAENNqkPJnOmKOwsuZExgnsrXXDg7ZhPDfY"  # <-- change this
+ADMIN_IDS = [8436218638]
+USERS_FILE = "users.json"
+ORDERS_FILE = "orders.json"
+
+ITEMS = {
+    1: {"name": "60 UC", "price": 10},
+    2: {"name": "325 UC", "price": 50},
+    3: {"name": "660 UC", "price": 100},
+    4: {"name": "1800 UC", "price": 250},
+    5: {"name": "3850 UC", "price": 500},
+    6: {"name": "8100 UC", "price": 1000},
+}
+
+ADMIN_INFO = (
+    "UCstore — ин боти расмии фурӯши UC барои PUBG Mobile ва дигар хидматҳои рақамии бозӣ мебошад."
 )
 
-# ==========================
-# CONFIG
-# ==========================
-BOT_TOKEN = "8394642029:AAH50ltfmxyRRBnPm3QTa3LAtx8MeDSqBU0"
-ADMIN_ID = 5808918857  # аз шумо гирифта шуд
-ADMIN_INSTAGRAM = "https://www.instagram.com/garant_alestr?igsh=cTE4bnA3NW5ycHFs"
-DB_FILE = "bot_data.db"
+VISA_NUMBER = "4439200020432471"
+SBER_NUMBER = "2202208496090011"
+FREE_UC_CHANNEL = "@marzbon_chanel"
 
-# card number for payment instruction
-PAYMENT_CARD = "577726627"
-PAYMENT_CONTACT = "+722773727"  # рақами барои паём ба админ дар паём барои фармоиш
+# -------------------- Persistence --------------------
 
-# ==========================
-# LOGGING
-# ==========================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+def load_json(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
 
 
-# ==========================
-# DATABASE HELPERS
-# ==========================
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # users: id (tg id), phone (text), first_name, last_name, created_at
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS users (
-            tg_id INTEGER PRIMARY KEY,
-            phone TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            created_at INTEGER
-        )"""
-    )
-    # products: id, category, code, title, price, meta (like diamonds count)
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT,
-            code TEXT,
-            title TEXT,
-            price INTEGER,
-            meta TEXT
-        )"""
-    )
-    # cart items: id, tg_id, product_id, added_at
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS cart (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            product_id INTEGER,
-            added_at INTEGER
-        )"""
-    )
-    # hearts (wishlist)
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS hearts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            product_id INTEGER,
-            added_at INTEGER
-        )"""
-    )
-    # orders
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER,
-            product_id INTEGER,
-            game_id TEXT,
-            status TEXT,
-            created_at INTEGER,
-            payment_file_id TEXT,
-            payment_file_type TEXT
-        )"""
-    )
-    conn.commit()
-    # seed products if empty
-    c.execute("SELECT COUNT(*) FROM products")
-    count = c.fetchone()[0]
-    if count == 0:
-        seed_products = [
-            # Almaz products (category 'almaz')
-            ("almaz", "A1", "💎100+5", 10, "100+5"),
-            ("almaz", "A2", "💎310+16", 28, "310+16"),
-            ("almaz", "A3", "💎510+26", 45, "510+26"),
-            ("almaz", "A4", "💎1060+53", 92, "1060+53"),
-            ("almaz", "A5", "💎2180+216", 185, "2180+216"),
-            ("almaz", "A6", "💎5600+560", 460, "5600+560"),
-            # Voucher products (category 'voucher'), meta holds diamonds-cost mapping
-            ("voucher", "V1", "Неделю - 450💎-17 см", 0, "week-450-17"),
-            ("voucher", "V2", "Месяц-2600💎-97 см", 0, "month-2600-97"),
-            ("voucher", "V3", "Лайт-90💎-7 см", 0, "lite-90-7"),
-        ]
-        c.executemany(
-            "INSERT INTO products (category,code,title,price,meta) VALUES (?,?,?,?,?)",
-            seed_products,
-        )
-        conn.commit()
-    conn.close()
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def db_execute(query, params=(), fetchone=False, fetchall=False):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(query, params)
-    data = None
-    if fetchone:
-        data = c.fetchone()
-    elif fetchall:
-        data = c.fetchall()
-    conn.commit()
-    conn.close()
-    return data
+def save_all():
+    save_json(USERS_FILE, users_data)
+    save_json(ORDERS_FILE, orders)
 
 
-# ==========================
-# UTIL
-# ==========================
-def main_menu_keyboard(is_admin=False):
-    buttons = [
-        [InlineKeyboardButton("🛍️ Мағоза", callback_data="shop")],
-        [InlineKeyboardButton("🧺 Сабад", callback_data="cart")],
-        [InlineKeyboardButton("💖 Дилхоҳо", callback_data="hearts")],
-        [InlineKeyboardButton("ℹ️ Маълумот", callback_data="info")],
-        [InlineKeyboardButton("👤 Профили админ", callback_data="admin_profile")],
-    ]
-    if is_admin:
-        buttons.append([InlineKeyboardButton("⚙️ Панели админ", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(buttons)
+users_data = load_json(USERS_FILE, {})  # key: user_id (str) -> info
+orders = load_json(ORDERS_FILE, [])  # list of orders
+
+# Runtime structures (not persisted)
+user_carts = {}
+user_wishlist = {}
+broadcast_mode = {}
+
+# -------------------- Helpers --------------------
+
+def generate_user_code(length: int = 6) -> str:
+    chars = string.ascii_uppercase + string.digits
+    return "".join(random.choice(chars) for _ in range(length))
 
 
-def shop_keyboard():
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Алмаз", callback_data="cat_almaz")],
-            [InlineKeyboardButton("Воучер", callback_data="cat_voucher")],
-            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
-        ]
-    )
-    return kb
+def _create_order_record(user_id: str, total: int, extra=None) -> dict:
+    order_id = random.randint(10000, 99999)
+    order = {
+        "id": order_id,
+        "user_id": user_id,
+        "user_name": users_data.get(user_id, {}).get("name", ""),
+        "username": users_data.get(user_id, {}).get("username", ""),
+        "phone": users_data.get(user_id, {}).get("phone", ""),
+        "total": total,
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "pending",
+        "extra": extra or {},
+    }
+    orders.append(order)
+    save_all()
+    return order
 
 
-def back_keyboard(callback="back_main"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Бозгашт", callback_data=callback)]])
+# -------------------- Handlers --------------------
 
-
-def product_options_keyboard(product_id):
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ Илова ба сабад", callback_data=f"addcart:{product_id}"),
-                InlineKeyboardButton("💖 Илова ба дилхоҳо", callback_data=f"addheart:{product_id}"),
-            ],
-            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="cat_back")],
-        ]
-    )
-
-
-def cart_item_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📦 Фармоиш додан", callback_data="order_start")],
-            [InlineKeyboardButton("🗑️ Пок кардан", callback_data="cart_clear")],
-            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
-        ]
-    )
-
-
-def heart_item_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➕ Илова ба сабад", callback_data="heart_to_cart")],
-            [InlineKeyboardButton("🗑️ Пок кардан", callback_data="heart_clear")],
-            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
-        ]
-    )
-
-
-def admin_panel_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📋 Рӯйхати корбарон", callback_data="admin_users")],
-            [InlineKeyboardButton("🧾 Фармоишҳо", callback_data="admin_orders")],
-            [InlineKeyboardButton("✉️ Паём ба корбарон", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
-        ]
-    )
-
-
-# ==========================
-# HANDLERS
-# ==========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    tg_id = user.id
-    first = user.first_name or ""
-    last = user.last_name or ""
-    now = int(time.time())
-    # save user if not exists
-    row = db_execute("SELECT tg_id FROM users WHERE tg_id = ?", (tg_id,), fetchone=True)
-    if not row:
-        db_execute(
-            "INSERT INTO users (tg_id, phone, first_name, last_name, created_at) VALUES (?,?,?,?,?)",
-            (tg_id, None, first, last, now),
-        )
+    # Entry point. Ask for phone contact if user not registered.
+    if not update.message:
+        return
 
-    # Request contact (keyboard) — but also accept manual phone input
-    kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("Расонам рақами телефон (Send contact)", request_contact=True)], ["Ворид кардани рақам дастӣ"]],
-        resize_keyboard=True,
-    )
+    user = update.message.from_user
+    user_id = str(user.id)
+
+    # If already registered, show menu
+    if user_id in users_data:
+        await update.message.reply_text(f"👋 Салом, {user.first_name}!")
+        await show_main_menu(update.message.chat, user_id)
+        return
+
+    # Ask for contact
+    contact_button = KeyboardButton("📱 Ворид шудан бо рақам", request_contact=True)
+    reply_markup = ReplyKeyboardMarkup([[contact_button]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "Салом! Барои идома, лутфан рақами телефонатонро фиристед.\nШумо метавонед тугмаи 'Send contact'-ро пахш кунед ё рақамро дастӣ ворид кунед.",
-        reply_markup=kb,
+        "🔐 Барои истифодаи бот рақами телефони худро фиристед:", reply_markup=reply_markup
     )
-    # set state expecting phone (we'll track with context.user_data)
-    context.user_data["expect"] = "phone"
 
-
-async def contact_or_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    text = None
-    phone = None
-    if update.message.contact:
-        phone = update.message.contact.phone_number
-    else:
-        text = update.message.text and update.message.text.strip()
-        # try to extract digits
-        if text:
-            digits = "".join(ch for ch in text if ch.isdigit() or ch == "+")
-            if len(digits) >= 5:
-                phone = digits
-    if not phone:
-        await update.message.reply_text("Рақам ё контакт нодуруст аст. Лутфан дубора кӯшиш кунед.")
+async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Save contact and create user record
+    contact = update.message.contact
+    if not contact:
+        await update.message.reply_text("⚠️ Лутфан контакт фиристед.")
         return
 
-    # store phone in DB
-    db_execute("UPDATE users SET phone = ? WHERE tg_id = ?", (phone, tg_id))
-    # now create a simple math captcha: add/sub two numbers
-    a = random.randint(1, 9)
-    b = random.randint(1, 9)
-    op = random.choice(["+", "-"])
-    if op == "+":
-        answer = a + b
-        qtext = f"Барои санҷиш, лутфан {a} + {b} = ? (фақат рақамҳо)"
-    else:
-        # ensure non-negative
-        if a < b:
-            a, b = b, a
-        answer = a - b
-        qtext = f"Барои санҷиш, лутфан {a} - {b} = ? (фақат рақамҳо)"
-    context.user_data["captcha_answer"] = str(answer)
-    await update.message.reply_text(qtext, reply_markup=ReplyKeyboardMarkup([["Бекор"]], resize_keyboard=True))
+    user = update.message.from_user
+    user_id = str(user.id)
+
+    user_code = generate_user_code(6)
+    users_data[user_id] = {
+        "id": user.id,
+        "name": user.first_name or "",
+        "username": user.username or "",
+        "phone": contact.phone_number,
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "free_uc": 0,
+        "last_claim": None,
+        "last_daily_uc": None,
+        "code": user_code,
+    }
+    save_all()
+
+    # Handle inviter stored in user_data (if /start payload was used)
+    inviter = context.user_data.get("invited_by")
+    if inviter and inviter != user_id and str(inviter) in users_data:
+        inv = str(inviter)
+        users_data[inv]["free_uc"] = users_data[inv].get("free_uc", 0) + 2
+        save_all()
+        try:
+            await context.bot.send_message(
+                int(inv),
+                f"🎉 Шумо 2 UC барои даъват кардани корбари нав гирифтед!\n"
+                f"👤 @{user.username or user.first_name}"
+            )
+        except Exception:
+            pass
+
+    # Notify admins
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin,
+                (
+                    "👤 Корбари нав сабт шуд!\n\n"
+                    f"🧑 Ном: {user.first_name}\n"
+                    f"📱 Рақам: {contact.phone_number}\n"
+                    f"🔗 @{user.username or '—'}\n"
+                    f"🔑 Код: {user_code}"
+                ),
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        f"✅ Шумо бо муваффақият ворид шудед!!\n"
+        f"🔑 Код шумо: {user_code}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    await show_main_menu(update.message.chat, user_id)
+
+async def show_main_menu(chat, user_id: str):
+    buttons = [
+        ["🛍 Каталог", "❤️ Дилхоҳҳо"],
+        ["🛒 Сабад", "💬 Профили админ"],
+        ["ℹ Маълумот", "🎁 UC ройгон"],
+    ]
+    if int(user_id) in ADMIN_IDS:
+        buttons.append(["👑 Панели админ"])
+
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+    await chat.send_message("Менюи асосӣ:", reply_markup=reply_markup)
 
 
-async def captcha_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    expect = context.user_data.get("expect")
-    if expect != "phone":
-        # ignore unless expecting captcha
+# Catalog handlers
+async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # works with both message and callback
+    target = update.message or (update.callback_query and update.callback_query.message)
+    if not target:
+        return
+
+    buttons = []
+    row = []
+    for i, item in ITEMS.items():
+        row.append(InlineKeyboardButton(f"{item['name']} — {item['price']} TJS", callback_data=f"select_{i}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")])
+
+    await target.reply_text("🛍 Каталог:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def select_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        item_id = int(query.data.split("_")[1])
+    except Exception:
+        await query.message.reply_text("⚠️ Мушкил дар интихоби маҳсулот.")
+        return
+
+    item = ITEMS.get(item_id)
+    if not item:
+        await query.message.reply_text("Маҳсулот пайдо нашуд.")
+        return
+
+    buttons = [
+        [InlineKeyboardButton("🛒 Илова ба сабад", callback_data=f"addcart_{item_id}"),
+         InlineKeyboardButton("❤️ Ба дилхоҳҳо", callback_data=f"addwish_{item_id}")],
+        [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
+    ]
+    await query.message.reply_text(f"🛍 {item['name']} — {item['price']} TJS", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def addcart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    try:
+        item_id = int(query.data.split("_")[1])
+    except Exception:
+        return
+    user_carts.setdefault(user_id, {})
+    user_carts[user_id][item_id] = user_carts[user_id].get(item_id, 0) + 1
+    await query.message.reply_text(f"✅ {ITEMS[item_id]['name']} ба сабад илова шуд!")
+
+
+async def addwish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    try:
+        item_id = int(query.data.split("_")[1])
+    except Exception:
+        return
+    user_wishlist.setdefault(user_id, set()).add(item_id)
+    await query.message.reply_text(f"❤️ {ITEMS[item_id]['name']} ба дилхоҳҳо илова шуд!")
+
+
+async def open_wishlist_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    wishlist = user_wishlist.get(user_id, set())
+    if not wishlist:
+        await update.message.reply_text("❤️ Дилхоҳҳо холист.")
+        return
+
+    for i in list(wishlist):
+        item = ITEMS.get(i)
+        if not item:
+            continue
+        buttons = [
+            [InlineKeyboardButton("🛒 Ба сабад", callback_data=f"addcart_{i}"),
+             InlineKeyboardButton("🗑️ Хок кардан", callback_data=f"removewish_{i}")]
+        ]
+        await update.message.reply_text(f"❤️ {item['name']} — {item['price']} TJS", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def removewish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("🗑️ Аз дилхоҳҳо ҳазф шуд!")
+    user_id = str(query.from_user.id)
+    try:
+        item_id = int(query.data.split("_")[1])
+    except Exception:
+        return
+    if user_id in user_wishlist:
+        user_wishlist[user_id].discard(item_id)
+    try:
+        await query.message.delete()
+    except Exception:
         pass
-    text = update.message.text.strip() if update.message.text else ""
-    if text == "Бекор":
-        await update.message.reply_text("Операсия бекор карда шуд. Нав оғоз кунед /start")
+        
+# Cart and checkout
+async def show_cart_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    cart = user_carts.get(user_id, {})
+    if not cart:
+        await update.message.reply_text("🛒 Сабад холист.")
         return
-    correct = context.user_data.get("captcha_answer")
-    if not correct:
-        await update.message.reply_text("Навсозӣ зарур аст. Лутфан /start занед.")
+
+    text = "🛍 Маҳсулоти шумо:\n"
+    total = 0
+    for i, qty in cart.items():
+        item = ITEMS.get(i)
+        if not item:
+            continue
+        subtotal = item["price"] * qty
+        total += subtotal
+        
+        text += f"- {item['name']} x{qty} = {subtotal} TJS\n"
+        
+    text += f"💰 Ҳамагӣ: {total} TJS"
+
+    buttons = [
+        [InlineKeyboardButton("📦 Фармоиш додан", callback_data="checkout"),
+         InlineKeyboardButton("🗑️ Пок кардан", callback_data="clear_cart")],
+        [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
+    ]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    
+async def clear_cart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("🧹 Сабад тоза шуд!")
+    user_id = str(query.from_user.id)
+    user_carts[user_id] = {}
+
+
+async def checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+    cart = user_carts.get(user_id, {})
+    if not cart:
+        await query.message.reply_text("🛒 Сабад холист.")
         return
-    if text == correct:
-        # success, show main menu
-        tg_id = update.effective_user.id
-        is_admin = tg_id == ADMIN_ID
-        await update.message.reply_text(
-            "Санҷиш бомуваффақият гузашт. Хуш омадед!",
-            reply_markup=main_menu_keyboard(is_admin=is_admin),
-        )
-        # clear expect
-        context.user_data.pop("expect", None)
-        context.user_data.pop("captcha_answer", None)
+
+    await query.message.reply_text("🎮 Лутфан ID-и бозии худро ворид кунед (фақат рақамҳо):")
+    context.user_data["awaiting_game_id"] = True
+    context.user_data["pending_order_total"] = sum(ITEMS[i]["price"] * q for i, q in cart.items())
+
+
+async def get_game_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_game_id"):
+        return
+    game_id = update.message.text.strip()
+    if not game_id.isdigit():
+        await update.message.reply_text("⚠️ Лутфан танҳо рақам ворид кунед (ID-и бозӣ бояд рақам бошад).")
+        return
+
+    context.user_data["awaiting_game_id"] = False
+
+    user_id = str(update.message.from_user.id)
+    total = context.user_data.pop("pending_order_total", 0)
+
+    # Create order and ask for payment method
+    order = _create_order_record(user_id, total)
+    order["game_id"] = game_id
+    order["status"] = "choose_payment"
+    save_all()
+
+    # Two payment buttons
+    buttons = [
+        [InlineKeyboardButton("💳 Пардохт VISA", callback_data=f"pay_visa_{order['id']}")],
+        [InlineKeyboardButton("🏦 Пардохт SberBank", callback_data=f"pay_sber_{order['id']}")]
+    ]
+
+    await update.message.reply_text(
+        f"Фармоиш №{order['id']} \n"
+        f"🎮 ID: {game_id}\n"
+        f"💰 Нархи умумӣ: {total} TJS\n\n"
+        "Лутфан тарзи пардохтро интихоб кунед:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# New: payment method selection handler
+async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    parts = data.split("_")
+    # expected: pay_visa_{id} or pay_sber_{id}
+    if len(parts) < 3:
+        await query.message.reply_text("⚠️ Формати маълумот нодуруст аст.")
+        return
+
+    method = parts[1]          # visa / sber
+    try:
+        order_id = int(parts[2])
+    except Exception:
+        await query.message.reply_text("⚠️ Формати фармоиш нодуруст аст.")
+        return
+
+    # choose card and name
+    if method == "visa":
+        card = VISA_NUMBER
+        method_name = "VISA"
     else:
-        await update.message.reply_text("Ҷавоб нодуруст. Лутфан дубора /start кунед ва рақамро такрор фиристед.")
+        card = SBER_NUMBER
+        method_name = "SberBank"
+
+    # find order
+    for order in orders:
+        if order["id"] == order_id:
+            order["status"] = "awaiting_proof"
+            order["payment_method"] = method_name
+            save_all()
+
+            await query.message.reply_text(
+                f"💳 Тарзи пардохт: {method_name}\n"
+                f"📌 Рақами корт/ҳисоб: {card}\n\n"
+                "Пас аз пардохт, лутфан квитанцияро ҳамчун акс ё файл ба ин чат фиристед."
+            )
+            return
+
+    await query.message.reply_text("⚠️ Фармоиш ёфт нашуд.")
+
+# Payment proof receive (photo or document)
+async def receive_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Either photo or document
+    user_id = str(update.message.from_user.id)
+
+    # Find last order from this user that is awaiting proof
+    order = None
+    for o in reversed(orders):
+        if str(o.get("user_id")) == user_id and o.get("status") == "awaiting_proof":
+            order = o
+            break
+
+    if not order:
+        await update.message.reply_text("⚠️ Шумо ҳоло фармоиши интизори квитанция надоред.")
+        return
+
+    # Accept photo or document
+    file_id = None
+    is_photo = False
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        is_photo = True
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        is_photo = False
+    else:
+        await update.message.reply_text("⚠️ Лутфан акс ё файл равон кунед!")
+        return
+
+    order["status"] = "proof_sent"
+    order["proof_file"] = file_id
+    save_all()
+
+    # Build caption for admin
+    caption = (
+        f"📦 Фармоиши №{order['id']}\n"
+        f"👤 @{order.get('username') or order.get('user_name')}\n"
+        f"🎮 ID: {order.get('game_id')}\n"
+        f"💰 {order.get('total')} TJS\n"
+        f"💳 Тарзи пардохт: {order.get('payment_method')}\n"
+        f"📱 Рақами корбар: {order.get('phone') or '—'}\n"
+        f"🕒 {order.get('time')}"
+    )
+
+    buttons = [
+        [
+            InlineKeyboardButton("✅ Тасдиқ", callback_data=f"pay_confirm_{order['id']}"),
+            InlineKeyboardButton("❌ Рад", callback_data=f"pay_reject_{order['id']}")
+        ]
+    ]
+
+    for admin in ADMIN_IDS:
+        try:
+            if is_photo:
+                await context.bot.send_photo(
+                    chat_id=admin,
+                    photo=file_id,
+                    caption=caption,
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+            else:
+                await context.bot.send_document(
+                    chat_id=admin,
+                    document=file_id,
+                    caption=caption,
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+        except Exception:
+            pass
+
+    await update.message.reply_text("✅ Квитанция қабул шуд! Мунтазир шавед, то админ тасдиқ кунад.")
 
 
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Admin confirm/reject for payments (pay_confirm_, pay_reject_)
+async def admin_payment_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("_")
+    # expected forms: pay_confirm_{id} or pay_reject_{id}
+    if len(parts) < 3:
+        await query.message.reply_text("⚠️ Формати маълумот нодуруст аст.")
+        return
+
+    action = parts[1]       # confirm / reject
+    try:
+        order_id = int(parts[2])
+    except Exception:
+        await query.message.reply_text("⚠️ Формати фармоиш нодуруст аст.")
+        return
+
+    for order in orders:
+        if order["id"] == order_id:
+            user_chat = int(order["user_id"])
+            if action == "confirm":
+                order["status"] = "confirmed"
+                save_all()
+                try:
+                    await context.bot.send_message(user_chat, f"✅ Пардохти шумо барои фармоиши №{order_id} тасдиқ шуд! Ташаккур.")
+                except Exception:
+                    pass
+                await query.message.reply_text(f"✅ Фармоиш №{order_id} тасдиқ шуд.")
+            else:
+                order["status"] = "rejected"
+                save_all()
+                try:
+                    await context.bot.send_message(user_chat, f"❌ Пардохти шумо барои фармоиши №{order_id} рад шуд. Лутфан бо админ тамос гиред.")
+                except Exception:
+                    pass
+                await query.message.reply_text(f"❌ Фармоиш №{order_id} рад шуд.")
+            return
+
+    await query.message.reply_text("⚠️ Фармоиш ёфт нашуд.")
+
+
+# Existing callback handlers for other flows remain (payment_accept/reject for another flow)
+async def callback_payment_accept_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    user = update.effective_user
-    tg_id = user.id
 
-    if data == "back_main":
-        await query.edit_message_text("Менюи асосӣ:", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
-        return
-
-    if data == "shop":
-        await query.edit_message_text("Мағоза — интихоб кунед:", reply_markup=shop_keyboard())
-        return
-
-    if data == "cat_almaz":
-        # list almaz products
-        rows = db_execute("SELECT id,title,price,meta FROM products WHERE category = 'almaz'", fetchall=True)
-        text = "Алмаз — интихоб кунед маҳсулот:\n\n"
-        kb = InlineKeyboardMarkup([])
-        for r in rows:
-            pid, title, price, meta = r[0], r[1], r[2], r[3]
-            text += f"{title} — {price} TJS\n"
-            kb.add(InlineKeyboardButton(title + f" — {price}TJS", callback_data=f"product:{pid}"))
-        kb.add(InlineKeyboardButton("⬅️ Бозгашт", callback_data="shop"))
-        await query.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data == "cat_voucher":
-        rows = db_execute("SELECT id,title,price,meta FROM products WHERE category = 'voucher'", fetchall=True)
-        text = "Воучер — интихоб кунед:\n\n"
-        kb = InlineKeyboardMarkup([])
-        for r in rows:
-            pid, title = r[0], r[1], r[2]
-            text += f"{title}\n"
-            kb.add(InlineKeyboardButton(title, callback_data=f"product:{pid}"))
-        kb.add(InlineKeyboardButton("⬅️ Бозгашт", callback_data="shop"))
-        await query.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data.startswith("product:"):
-        pid = int(data.split(":", 1)[1])
-        p = db_execute("SELECT title,price,meta FROM products WHERE id = ?", (pid,), fetchone=True)
-        if not p:
-            await query.edit_message_text("Маҳсулот ёфт нашуд.", reply_markup=shop_keyboard())
+    if data.startswith("payment_accept_"):
+        parts = data.split("_")
+        try:
+            order_id = int(parts[2])
+            user_id = int(parts[3])
+        except Exception:
+            await query.message.reply_text("⚠️ Формати маълумот нодуруст аст.")
             return
-        title, price, meta = p
-        await query.edit_message_text(f"{title}\nНархи: {price} TJS\n\nИнтихоби амал:", reply_markup=product_options_keyboard(pid))
-        return
+        for o in orders:
+            if o["id"] == order_id and str(o["user_id"]) == str(user_id):
+                o["status"] = "confirmed"
+                save_all()
+                try:
+                    await context.bot.send_message(int(user_id), f"✅ Пардохти шумо барои фармоиши №{order_id} қабул шуд! Ташаккур.")
+                except Exception:
+                    pass
+                await query.message.reply_text(f"✅ Пардохти фармоиш №{order_id} тасдиқ шуд.")
+                return
+        await query.message.reply_text("Фармоиш ёфт нашуд.")
 
-    if data.startswith("addcart:"):
-        pid = int(data.split(":", 1)[1])
-        db_execute("INSERT INTO cart (tg_id, product_id, added_at) VALUES (?,?,?)", (tg_id, pid, int(time.time())))
-        await query.edit_message_text("Маҳсулот ба сабад илова шуд.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
-        return
-
-    if data.startswith("addheart:"):
-        pid = int(data.split(":", 1)[1])
-        db_execute("INSERT INTO hearts (tg_id, product_id, added_at) VALUES (?,?,?)", (tg_id, pid, int(time.time())))
-        await query.edit_message_text("Маҳсулот ба дилхоҳо (wishlist) илова шуд.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
-        return
-
-    if data == "cart":
-        rows = db_execute("SELECT c.id,p.title,p.price FROM cart c JOIN products p ON c.product_id=p.id WHERE c.tg_id = ?", (tg_id,), fetchall=True)
-        if not rows:
-            await query.edit_message_text("Сабад холӣ аст.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
+    elif data.startswith("payment_reject_"):
+        parts = data.split("_")
+        try:
+            order_id = int(parts[2])
+            user_id = int(parts[3])
+        except Exception:
+            await query.message.reply_text("⚠️ Формати маълумот нодуруст аст.")
             return
-        text = "Маҳсулотҳои дар сабад:\n\n"
-        total = 0
-        for r in rows:
-            cid, title, price = r
-            text += f"- {title} — {price} TJS\n"
-            total += price
-        text += f"\nҲамагӣ: {total} TJS"
-        await query.edit_message_text(text, reply_markup=cart_item_keyboard())
+        for o in orders:
+            if o["id"] == order_id and str(o["user_id"]) == str(user_id):
+                o["status"] = "rejected"
+                save_all()
+                try:
+                    await context.bot.send_message(int(user_id), f"❌ Пардохти шумо барои фармоиши №{order_id} рад шуд. Лутфан бо админ тамос гиред.")
+                except Exception:
+                    pass
+                await query.message.reply_text(f"❌ Пардохти фармоиш №{order_id} рад шуд.")
+                return
+        await query.message.reply_text("Фармоиш ёфт нашуд.")
+
+
+# Free UC system
+async def free_uc_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.message.chat if update.message else update.callback_query.message.chat
+    from_user = update.message.from_user if update.message else update.callback_query.from_user
+    user_id = str(from_user.id)
+
+    if user_id not in users_data:
+        await chat.send_message("⚠️ Аввал /start кунед.")
         return
 
-    if data == "hearts":
-        rows = db_execute("SELECT h.id,p.title,p.price FROM hearts h JOIN products p ON h.product_id=p.id WHERE h.tg_id = ?", (tg_id,), fetchall=True)
-        if not rows:
-            await query.edit_message_text("Дилхоҳо холӣ аст.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
+    # Check subscription (best-effort; may fail for private channels)
+    subscribed = False
+    try:
+        member = await context.bot.get_chat_member(FREE_UC_CHANNEL, int(user_id))
+        subscribed = member.status in ["member", "administrator", "creator"]
+    except Exception:
+        subscribed = False
+
+    buttons = []
+    if subscribed:
+        buttons.append([InlineKeyboardButton("🎲 Гирифтани UC-и рӯзона", callback_data="daily_uc")])
+        buttons.append([InlineKeyboardButton("📊 UC-и ҷамъшуда", callback_data="my_uc")])
+        buttons.append([
+            InlineKeyboardButton("🎁 60 UC", callback_data="claim_60"),
+            InlineKeyboardButton("🎁 325 UC", callback_data="claim_325"),
+        ])
+    else:
+        channel_url = f"https://t.me/{FREE_UC_CHANNEL.lstrip('@')}"
+        buttons.append([InlineKeyboardButton("📢 Обуна шудан", url=channel_url)])
+        buttons.append([InlineKeyboardButton("🔄 Санҷиш", callback_data="check_sub_ucfree")])
+
+    buttons.append([InlineKeyboardButton("🔗 Даъвати дӯстон", callback_data="invite_link")])
+    await chat.send_message("🎁 Менюи UC ройгон:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await free_uc_menu(update, context)
+
+
+async def daily_uc_roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = str(q.from_user.id)
+    user = users_data.get(user_id)
+    if not user:
+        await q.message.reply_text("⚠️ Аввал /start кунед.")
+        return
+
+    now = datetime.datetime.now()
+    last = user.get("last_daily_uc")
+    if last:
+        try:
+            last_dt = datetime.datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+            if (now - last_dt).total_seconds() < 24 * 3600:
+                remaining = int((24 * 3600 - (now - last_dt).total_seconds()) // 3600)
+                await q.message.reply_text(f"⏳ Шумо аллакай UC гирифтед. Ба шумо боз {remaining} соат мондааст.")
+                return
+        except Exception:
+            pass
+
+    roll = random.choices([1, 2, 3, 4, 5], weights=[70, 20, 7, 2, 1])[0]
+    user["free_uc"] = user.get("free_uc", 0) + roll
+    user["last_daily_uc"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    users_data[user_id] = user
+    save_all()
+    await q.message.reply_text(f"🎉 Шумо {roll} UC гирифтед!\n📊 Ҳамагӣ: {user['free_uc']} UC")
+
+
+async def my_uc_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = str(q.from_user.id)
+    user = users_data.get(user_id, {})
+    amount = user.get("free_uc", 0)
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 60 UC", callback_data="claim_60")],
+        [InlineKeyboardButton("🎁 325 UC", callback_data="claim_325")],
+    ])
+    await q.message.reply_text(f"📊 Шумо доред: {amount} UC", reply_markup=btn)
+
+
+async def claim_uc_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    needed = 60 if data == "claim_60" else 325 if data == "claim_325" else None
+    if not needed:
+        return
+    user_id = str(q.from_user.id)
+    user = users_data.get(user_id, {})
+    if user.get("free_uc", 0) < needed:
+        await q.message.reply_text(f"❌ Шумо UC кофӣ надоред. Шумо доред: {user.get('free_uc', 0)} UC")
+        return
+    context.user_data["awaiting_free_id"] = needed
+    await q.message.reply_text("🎮 Лутфан ID-и PUBG-ро ворид кунед (8–15 рақам):")
+
+
+async def get_free_uc_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "awaiting_free_id" not in context.user_data:
+        return
+    t = update.message.text.strip()
+    if not t.isdigit() or not (8 <= len(t) <= 15):
+        await update.message.reply_text("⚠️ Танҳо рақам, аз 8 то 15 рақам! Лутфан дубора кӯшиш кунед.")
+        return
+    amount = context.user_data.pop("awaiting_free_id")
+    user_id = str(update.message.from_user.id)
+    user = users_data.get(user_id)
+    if not user:
+        await update.message.reply_text("⚠️ Аввал /start кунед.")
+        return
+
+    user["free_uc"] = max(0, user.get("free_uc", 0) - amount)
+    users_data[user_id] = user
+    save_all()
+
+    order_id = random.randint(10000, 99999)
+    order = {
+        "id": order_id,
+        "user_id": user_id,
+        "username": user.get("username"),
+        "phone": user.get("phone"),
+        "total": 0,
+        "type": "free_uc",
+        "pack": amount,
+        "game_id": t,
+        "status": "pending",
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    orders.append(order)
+    save_all()
+
+    for admin in ADMIN_IDS:
+        try:
+            btn = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Тасдиқ", callback_data=f"admin_confirm_free_{order_id}"),
+                    InlineKeyboardButton("❌ Рад", callback_data=f"admin_reject_free_{order_id}"),
+                ]
+            ])
+            await context.bot.send_message(
+                admin,
+                f"📦 Фармоиши UC ройгон №{order_id}\n👤 @{order['username']}\n🎮 ID: {t}\n🎁 Пакет: {amount} UC",
+                reply_markup=btn,
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"🎁 Дархости {amount} UC ба админ фиристода шуд! (Фармоиш №{order_id})")
+
+
+async def admin_confirm_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        order_id = int(q.data.split("_")[-1])
+    except Exception:
+        return
+    for o in orders:
+        if o["id"] == order_id and o.get("type") == "free_uc":
+            if o["status"] != "pending":
+                await q.message.reply_text(f"Фармоиш аллакай дар ҳолати: {o['status']}")
+                return
+            o["status"] = "confirmed"
+            save_all()
+            try:
+                await context.bot.send_message(int(o["user_id"]), f"✅ Дархости UC (№{order_id}) тасдиқ шуд! Ташаккур.")
+            except Exception:
+                pass
+            await q.message.reply_text("✅ Тасдиқ шуд.")
             return
-        text = "Маҳсулотҳои дар дилхоҳо:\n\n"
-        for r in rows:
-            hid, title, price = r
-            text += f"- {title} — {price} TJS\n"
-        await query.edit_message_text(text, reply_markup=heart_item_keyboard())
-        return
+    await q.message.reply_text("Фармоиш ёфт нашуд.")
 
-    if data == "cat_back":
-        await query.edit_message_text("Мағоза — интихоб кунед:", reply_markup=shop_keyboard())
-        return
 
-    if data == "cart_clear":
-        db_execute("DELETE FROM cart WHERE tg_id = ?", (tg_id,))
-        await query.edit_message_text("Сабад пок карда шуд.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
+async def admin_reject_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        order_id = int(q.data.split("_")[-1])
+    except Exception:
         return
-
-    if data == "heart_clear":
-        db_execute("DELETE FROM hearts WHERE tg_id = ?", (tg_id,))
-        await query.edit_message_text("Дилхоҳо пок карда шуд.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
-        return
-
-    if data == "heart_to_cart":
-        # move all hearts to cart
-        items = db_execute("SELECT product_id FROM hearts WHERE tg_id = ?", (tg_id,), fetchall=True)
-        if not items:
-            await query.edit_message_text("Дилхоҳо холӣ.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
+    for o in orders:
+        if o["id"] == order_id and o.get("type") == "free_uc":
+            o["status"] = "rejected"
+            save_all()
+            try:
+                await context.bot.send_message(int(o["user_id"]), f"❌ Дархост (№{order_id}) рад шуд. Лутфан бо админ тамос гиред.")
+            except Exception:
+                pass
+            await q.message.reply_text("❌ Рад шуд.")
             return
-        for it in items:
-            pid = it[0]
-            db_execute("INSERT INTO cart (tg_id, product_id, added_at) VALUES (?,?,?)", (tg_id, pid, int(time.time())))
-        db_execute("DELETE FROM hearts WHERE tg_id = ?", (tg_id,))
-        await query.edit_message_text("Ҳамаи маҳсулотҳо ба сабад интиқол ёфтанд.", reply_markup=main_menu_keyboard(is_admin=(tg_id == ADMIN_ID)))
-        return
+    await q.message.reply_text("Фармоиш ёфт нашуд.")
 
-    if data == "order_start":
-        # Expect Game/ID from user — ask for numeric ID
-        await query.edit_message_text("Лутфан ID-и бозиро ворид кунед (фаqat рақамҳо):", reply_markup=back_keyboard("cart"))
-        # set state
-        context.user_data["expect_order_game_id"] = True
-        return
 
-    if data == "admin_profile":
-        rows = db_execute("SELECT first_name, last_name, phone FROM users WHERE tg_id = ?", (ADMIN_ID,), fetchone=True)
-        admin_info = f"Admin: {ADMIN_ID}\nInstagram: {ADMIN_INSTAGRAM}"
-        await query.edit_message_text(admin_info, reply_markup=back_keyboard())
+# Admin confirm/reject for paid orders (original flow)
+async def admin_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        order_id = int(query.data.split("_")[-1])
+    except Exception:
         return
+    for o in orders:
+        if o["id"] == order_id:
+            if o["status"] != "pending":
+                await query.message.reply_text(f"Фармоиш аллакай дар ҳолати: {o['status']}")
+                return
+            o["status"] = "awaiting_payment"
+            save_all()
+            try:
+                await context.bot.send_message(
+                    int(o["user_id"]),
+                    f"💳 Барои анҷом додани пардохт, лутфан ба рақами VISA зер пардохт кунед:\n\n🔹 {VISA_NUMBER}\n\nПас аз пардохт, скриншоти тасдиқро ба ин ҷо фиристед 📸",
+                )
+            except Exception:
+                pass
+            await query.message.reply_text(f"📨 Рақами VISA ба @{o['username'] or o['user_name']} фиристода шуд.")
+            return
+    await query.message.reply_text("Фармоиш ёфт нашуд.")
 
-    if data == "info":
-        info_text = "Ин бот барои харид ва идораи фармоишҳо сохта шудааст.\n\nДастур: /start барои оғоз."
-        await query.edit_message_text(info_text, reply_markup=back_keyboard())
+
+async def admin_reject_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        order_id = int(query.data.split("_")[-1])
+    except Exception:
         return
+    for o in orders:
+        if o["id"] == order_id:
+            if o["status"] != "pending":
+                await query.message.reply_text(f"Фармоиш аллакай дар ҳолати: {o['status']}")
+                return
+            o["status"] = "rejected"
+            save_all()
+            try:
+                await context.bot.send_message(int(o["user_id"]), f"❌ Фармоиши шумо №{o['id']} рад шуд. Лутфан бо админ тамос гиред.")
+            except Exception:
+                pass
+            await query.message.reply_text(f"❌ Фармоиш №{order_id} рад шуд.")
+            return
+    await query.message.reply_text("Фармоиш ёфт нашуд.")
+
+
+# Invite link
+async def invite_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    uid = str(user.id)
+    try:
+        bot = await context.bot.get_me()
+        bot_username = bot.username
+    except Exception:
+        await q.message.reply_text("⚠️ Хато: бот номи худро ёфта натавонист.")
+        return
+    invite_url = f"https://t.me/{bot_username}?start=invite_{uid}"
+    await q.message.reply_text(
+        "🔗 Ин линкро ба дӯстонат фирист:\n\n" + invite_url + "\n\nҲар дӯсте, ки сабт мешавад → ту 2 UC мегирӣ!"
+    )
+
+
+# Admin panel (single implementation)
+async def admin_panel_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = str(query.from_user.id)
 
     if data == "admin_panel":
-        if tg_id != ADMIN_ID:
-            await query.edit_message_text("Шумо админ нестед.")
-            return
-        await query.edit_message_text("Панели админ:", reply_markup=admin_panel_keyboard())
+        keyboard = [
+            [InlineKeyboardButton("👤 Корбарон", callback_data="admin_users")],
+            [InlineKeyboardButton("📦 Заказҳо", callback_data="admin_orders")],
+            [InlineKeyboardButton("📢 Расонидани паём", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
+        ]
+        await query.message.edit_text(
+            "⚙️ *Панели Администратор*\nДар ин ҷо ту тамоми мағоза ва корбарҳоро идора мекунӣ.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
         return
 
-    # Admin panel callbacks
     if data == "admin_users":
-        if tg_id != ADMIN_ID:
-            await query.edit_message_text("Рузӣ нест.")
-            return
-        users = db_execute("SELECT tg_id,first_name,last_name,phone,created_at FROM users ORDER BY created_at DESC", fetchall=True)
-        text = "Рӯйхати корбарон:\n\n"
-        for u in users:
-            uid, fn, ln, phone, created = u
-            created_s = datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M")
-            text += f"ID: {uid} — {fn or ''} {ln or ''} — {phone or '-'} — {created_s}\n"
-        await query.edit_message_text(text or "Корбарон вуҷуд надоранд.", reply_markup=back_keyboard("admin_panel"))
+        if not users_data:
+            text = "📋 Ҳоло ҳеҷ корбар нест."
+        else:
+            text = "📋 *Рӯйхати корбарон:*\n\n"
+            for uid, u in users_data.items():
+                text += f"• {u.get('name','—')} — {u.get('phone','—')} (id: {uid})\n"
+        await query.message.edit_text(
+            text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Бозгашт", callback_data="admin_panel")]])
+        )
         return
 
     if data == "admin_orders":
-        if tg_id != ADMIN_ID:
-            await query.edit_message_text("Дастрасӣ нест.")
-            return
-        orders = db_execute(
-            "SELECT o.id,o.tg_id,o.product_id,o.status,o.created_at,p.title FROM orders o LEFT JOIN products p ON o.product_id=p.id ORDER BY o.created_at DESC",
-            fetchall=True,
-        )
         if not orders:
-            await query.edit_message_text("Фармоишҳо вуҷуд надоранд.", reply_markup=back_keyboard("admin_panel"))
-            return
-        text = "Фармоишҳо:\n\n"
-        for o in orders:
-            oid, uid, pid, status, created, title = o
-            created_s = datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M")
-            text += f"#{oid} — User:{uid} — {title} — {status} — {created_s}\n"
-        await query.edit_message_text(text, reply_markup=back_keyboard("admin_panel"))
+            text = "❗ Ҳоло ҳеҷ заказ нест."
+        else:
+            text = "📦 *Рӯйхати заказҳо:*\n\n"
+            for o in orders:
+                text += f"#{o['id']} — @{o.get('username') or o.get('user_name','-')} — {o.get('total', o.get('pack',0))} — {o['status']}\n"
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Бозгашт", callback_data="admin_panel")]]))
         return
 
     if data == "admin_broadcast":
-        if tg_id != ADMIN_ID:
-            await query.edit_message_text("Дастрасӣ нест.")
-            return
-        await query.edit_message_text("Лутфан матни паём ба ҳамаи корбаронро фиристед. (Матни оддӣ)", reply_markup=back_keyboard("admin_panel"))
-        context.user_data["expect_broadcast"] = True
+        broadcast_mode[user_id] = True
+        await query.message.edit_text("✏️ Ҳозир матни паёмро навис — ман онро ба *ҳама корбарҳо* мефиристам.", parse_mode="Markdown")
         return
 
-    # Accept/Reject order callbacks (admin action forwarded when payment file is sent)
-    if data.startswith("admin_accept:") or data.startswith("admin_reject:"):
-        if tg_id != ADMIN_ID:
-            await query.edit_message_text("Дастрасӣ нест.")
-            return
-        parts = data.split(":")
-        action = parts[0].split("_")[1] if "_" in parts[0] else parts[0].split("admin_")[1]
-        order_id = int(parts[1])
-        order = db_execute("SELECT tg_id, product_id FROM orders WHERE id = ?", (order_id,), fetchone=True)
-        if not order:
-            await query.edit_message_text("Фармоиш ёфт нашуд.", reply_markup=back_keyboard("admin_panel"))
-            return
-        user_id, product_id = order
-        product = db_execute("SELECT title FROM products WHERE id = ?", (product_id,), fetchone=True)
-        product_title = product[0] if product else "Маҳсулот"
-        if data.startswith("admin_accept:"):
-            # mark accepted
-            db_execute("UPDATE orders SET status = ? WHERE id = ?", ("accepted", order_id))
-            try:
-                await context.bot.send_message(user_id, f"Маҳсулот ({product_title}) ба ҳисоби шумо фиристода шуд.")
-            except Exception as e:
-                logger.exception("Failed to send accept msg to user")
-            await query.edit_message_text(f"Фармоиш #{order_id} қабул шуд.", reply_markup=back_keyboard("admin_panel"))
-        else:
-            db_execute("UPDATE orders SET status = ? WHERE id = ?", ("rejected", order_id))
-            try:
-                await context.bot.send_message(user_id, "Фармоиш рад карда шуд — пардохт анҷом дода нашуд. Агар савол бошад, ба админ муроҷиат кунед.")
-            except Exception as e:
-                logger.exception("Failed to send reject msg to user")
-            await query.edit_message_text(f"Фармоиш #{order_id} рад шуд.", reply_markup=back_keyboard("admin_panel"))
-        return
 
-    # Fallback
-    await query.edit_message_text("Амалиёт маълум нест.", reply_markup=back_keyboard())
+# Text handler
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = str(update.message.from_user.id)
 
-
-async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    tg_id = user.id
-    text = update.message.text.strip() if update.message.text else ""
-
-    # Admin broadcast flow
-    if context.user_data.get("expect_broadcast") and tg_id == ADMIN_ID:
-        # send to all users
-        users = db_execute("SELECT tg_id FROM users", fetchall=True)
+    # Broadcast mode
+    if broadcast_mode.get(user_id):
+        msg = text
         count = 0
-        for u in users:
-            uid = u[0]
+        for uid in list(users_data.keys()):
             try:
-                await context.bot.send_message(uid, f"🔔 Хабар аз админ:\n\n{text}")
+                await context.bot.send_message(int(uid), f"📣 Паём аз админ:\n\n{msg}")
                 count += 1
             except Exception:
                 pass
-        await update.message.reply_text(f"Паём ба {count} корбар фиристода шуд.", reply_markup=admin_panel_keyboard())
-        context.user_data.pop("expect_broadcast", None)
+        await update.message.reply_text(f"✅ Паём ба {count} корбар фиристода шуд.")
+        broadcast_mode[user_id] = False
         return
 
-    # Expecting order game ID
-    if context.user_data.get("expect_order_game_id"):
-        # verify digits only
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if not digits:
-            await update.message.reply_text("ID нодуруст аст. Танҳо рақамҳоро ворид кунед.")
-            return
-        game_id = digits
-        # create order(s) for all items in cart
-        cart_items = db_execute("SELECT product_id FROM cart WHERE tg_id = ?", (tg_id,), fetchall=True)
-        if not cart_items:
-            await update.message.reply_text("Сабад холӣ аст.", reply_markup=main_menu_keyboard(is_admin=(tg_id==ADMIN_ID)))
-            context.user_data.pop("expect_order_game_id", None)
-            return
-        created = int(time.time())
-        for item in cart_items:
-            pid = item[0]
-            db_execute(
-                "INSERT INTO orders (tg_id,product_id,game_id,status,created_at) VALUES (?,?,?,?,?)",
-                (tg_id, pid, game_id, "pending_payment", created),
-            )
-        # clear cart after creating orders
-        db_execute("DELETE FROM cart WHERE tg_id = ?", (tg_id,))
+    # Menu commands
+    if text == "🛍 Каталог":
+        await catalog_handler(update, context)
+    elif text == "❤️ Дилхоҳҳо":
+        await open_wishlist_from_text(update, context)
+    elif text == "🛒 Сабад":
+        await show_cart_from_text(update, context)
+    elif text == "ℹ Маълумот":
+        await update.message.reply_text(ADMIN_INFO)
+    elif text == "💬 Профили админ":
         await update.message.reply_text(
-            f"Ҳоло тасвири квитансия ё файлро ҳамчун исботи пардохт бор кунед.\n\nРақами корт: {PAYMENT_CARD}\nБа ин рақам пардохт карда, файл/скриншот фиристед.\n(Ҳамин паём ба админ фиристонида мешавад.)",
-            reply_markup=back_keyboard(),
+            "Барои тамос бо админ зер кунед:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Профили админ", url=f"tg://user?id={ADMIN_IDS[0]}")]]),
         )
-        # set state to expect payment file
-        context.user_data["expect_payment_file"] = True
-        context.user_data.pop("expect_order_game_id", None)
-        return
-
-    # If expecting phone captcha answer, handle like captcha (we set expect earlier in start flow)
-    if context.user_data.get("captcha_answer"):
-        # reuse captcha handler style
-        if text == context.user_data.get("captcha_answer"):
-            is_admin = tg_id == ADMIN_ID
-            await update.message.reply_text("Санҷиш бомуваффақият гузашт.", reply_markup=main_menu_keyboard(is_admin=is_admin))
-            context.user_data.pop("captcha_answer", None)
-            context.user_data.pop("expect", None)
-        else:
-            await update.message.reply_text("Ҷавоб нодуруст. Лутфан /start ро боз занед ва такрор кунед.")
-        return
-
-    # If expecting broadcast or others handled above, else general help
-    await update.message.reply_text("Ман ин паёмро фаҳмидам, аммо барои идома аз меню истифода кунед. /start")
-
-
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle photo or document uploaded as payment proof.
-    Forward to admin with buttons Accept/Reject.
-    """
-    user = update.effective_user
-    tg_id = user.id
-
-    if not context.user_data.get("expect_payment_file"):
-        await update.message.reply_text("Ман дар ҳолати интизори файли пардохт нестам. Агар фармоиш доред - иваз /start.")
-        return
-
-    # find the latest pending orders of this user (we created them earlier)
-    orders = db_execute("SELECT id,product_id FROM orders WHERE tg_id = ? AND status = 'pending_payment' ORDER BY created_at DESC", (tg_id,), fetchall=True)
-    if not orders:
-        await update.message.reply_text("Фармоишҳо ёфт нашуд. Лутфан дубора санҷед.", reply_markup=main_menu_keyboard(is_admin=(tg_id==ADMIN_ID)))
-        context.user_data.pop("expect_payment_file", None)
-        return
-
-    # forward file to admin + send order info and inline accept/reject buttons
-    # handle photo vs document
-    file_caption = f"Фармоиш: User: {tg_id}\n"
-    # We'll attach order ids and game id
-    order_ids = [str(o[0]) for o in orders]
-    first_order_id = order_ids[0]
-    game_id = db_execute("SELECT game_id FROM orders WHERE id = ?", (orders[0][0],), fetchone=True)[0]
-    file_caption += f"Order IDs: {', '.join(order_ids)}\nGame ID: {game_id}\nПрофил: @{user.username if user.username else '-'}\n"
-    # when user sends photo
-    if update.message.photo:
-        ph = update.message.photo[-1]  # best quality
-        file_id = ph.file_id
-        # forward to admin
-        msg = await context.bot.send_photo(
-            ADMIN_ID,
-            photo=file_id,
-            caption=file_caption,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("✔️ Қабул", callback_data=f"admin_accept:{first_order_id}"),
-                        InlineKeyboardButton("❌ Рад", callback_data=f"admin_reject:{first_order_id}"),
-                    ]
-                ]
-            ),
-        )
-    elif update.message.document:
-        doc = update.message.document
-        file_id = doc.file_id
-        msg = await context.bot.send_document(
-            ADMIN_ID,
-            document=file_id,
-            caption=file_caption,
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton("✔️ Қабул", callback_data=f"admin_accept:{first_order_id}"),
-                        InlineKeyboardButton("❌ Рад", callback_data=f"admin_reject:{first_order_id}"),
-                    ]
-                ]
-            ),
-        )
+    elif text == "👑 Панели админ" and int(user_id) in ADMIN_IDS:
+        buttons = [
+            [InlineKeyboardButton("📋 Рӯйхати корбарон", callback_data="admin_users"), InlineKeyboardButton("📦 Фармоишҳо", callback_data="admin_orders")],
+            [InlineKeyboardButton("📣 Паём ба корбарон", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
+        ]
+        await update.message.reply_text("👑 Панели админ:", reply_markup=InlineKeyboardMarkup(buttons))
+    elif text == "🎁 UC ройгон":
+        await free_uc_menu(update, context)
     else:
-        await update.message.reply_text("Файлро тасдиқ карда натавонистам. Лутфан тасвир ё ҳуҷҷат фиристед.")
+        await update.message.reply_text("🤖 Лутфан аз тугмаҳои меню истифода баред.")
+
+
+# Text router for awaiting inputs
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_game_id"):
+        await get_game_id(update, context)
+        return
+    if "awaiting_free_id" in context.user_data:
+        await get_free_uc_id(update, context)
+        return
+    await handle_text(update, context)
+
+
+# Callback router
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    data = query.data
+
+    # Admin panel shortcuts
+    if data in ["admin_panel", "admin_users", "admin_orders", "admin_broadcast", "back_admin"]:
+        await admin_panel_main(update, context)
         return
 
-    # update orders with file info (store file_id in payment_file_id)
-    for oid in order_ids:
-        db_execute("UPDATE orders SET payment_file_id = ?, payment_file_type = ? WHERE id = ?", (file_id, "photo" if update.message.photo else "document", int(oid)))
+    # Catalog and cart
+    if data.startswith("select_"):
+        await select_item_callback(update, context)
+    elif data.startswith("addcart_"):
+        await addcart_callback(update, context)
+    elif data.startswith("addwish_"):
+        await addwish_callback(update, context)
+    elif data.startswith("removewish_"):
+        await removewish_callback(update, context)
+    elif data == "clear_cart":
+        await clear_cart_callback(update, context)
+    elif data == "checkout":
+        await checkout_callback(update, context)
+    elif data == "back_main":
+        uid = str(query.from_user.id)
+        await show_main_menu(query.message.chat, uid)
 
-    await update.message.reply_text("Файл гирифта шуд ва ба админ фиристода шуд. Ҳангоми тасдиқ админ ба шумо хабар медиҳад.")
-    context.user_data.pop("expect_payment_file", None)
+    # Admin store confirm/reject
+    elif data.startswith("admin_confirm_"):
+        await admin_confirm_callback(update, context)
+    elif data.startswith("admin_reject_"):
+        await admin_reject_callback(update, context)
+
+    # Payment accept/reject (legacy)
+    elif data.startswith("payment_accept_") or data.startswith("payment_reject_"):
+        await callback_payment_accept_reject(update, context)
+
+    # NEW: payment method selection (VISA / SBER)
+    elif data.startswith("pay_visa_") or data.startswith("pay_sber_"):
+        await payment_method_callback(update, context)
+
+    # NEW: admin confirm/reject for proofs
+    elif data.startswith("pay_confirm_") or data.startswith("pay_reject_"):
+        await admin_payment_verify(update, context)
+
+    # Free UC callbacks
+    elif data == "check_sub_ucfree":
+        await check_sub_callback(update, context)
+    elif data == "daily_uc":
+        await daily_uc_roll(update, context)
+    elif data == "my_uc":
+        await my_uc_info(update, context)
+    elif data in ["claim_60", "claim_325"]:
+        await claim_uc_button(update, context)
+    elif data.startswith("admin_confirm_free_"):
+        await admin_confirm_free(update, context)
+    elif data.startswith("admin_reject_free_"):
+        await admin_reject_free(update, context)
+    elif data == "invite_link":
+        await invite_link_callback(update, context)
+    else:
+        await query.answer()
 
 
-# error handler
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+# Commands
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🆘 Фармонҳо: /start, /help, /about, /users (админ)")
 
 
-# ==========================
-# MAIN
-# ==========================
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(ADMIN_INFO)
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if int(update.message.from_user.id) not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Танҳо админ!")
+        return
+    if not users_data:
+        await update.message.reply_text("Ҳеҷ корбар сабт нашудааст.")
+        return
+    text = "📋 Рӯйхати корбарон:\n\n"
+    for u in users_data.values():
+        text += f"👤 {u.get('name','—')} — {u.get('phone','—')} (id: {u.get('id')})\n"
+    await update.message.reply_text(text)
+
+
+# Extra command wrappers
+async def catalog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await catalog_handler(update, context)
+
+
+async def cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_cart_from_text(update, context)
+
+
+async def wishlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await open_wishlist_from_text(update, context)
+
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(ADMIN_INFO)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = int(update.message.from_user.id)
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Танҳо админ!")
+        return
+    buttons = [
+        [InlineKeyboardButton("📋 Рӯйхати корбарон", callback_data="admin_users"), InlineKeyboardButton("📦 Фармоишҳо", callback_data="admin_orders")],
+        [InlineKeyboardButton("📣 Паём ба корбарон", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("⬅️ Бозгашт", callback_data="back_main")],
+    ]
+    await update.message.reply_text("👑 Панели админ:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+# Main
+
 def main():
-    init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    if TOKEN == "REPLACE_WITH_YOUR_BOT_TOKEN":
+        print("Please set TOKEN in the script before running.")
+        return
+
+    app = ApplicationBuilder().token(TOKEN).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    # contact / phone text or captcha
-    app.add_handler(MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), contact_or_phone_handler), group=0)
-    # Captcha answer (we'll allow text handler to process)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, captcha_handler), group=1)
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("users", users_command))
 
-    # CallbackQuery router
+    # Extra commands
+    app.add_handler(CommandHandler("catalog", catalog_command))
+    app.add_handler(CommandHandler("cart", cart_command))
+    app.add_handler(CommandHandler("wishlist", wishlist_command))
+    app.add_handler(CommandHandler("info", info_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+
+    # Contact handler
+    app.add_handler(MessageHandler(filters.CONTACT, get_contact))
+
+    # CallbackQuery (single router)
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    # File handler (photos/documents)
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, file_handler))
+    # Photos & Documents (payment proofs)
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & (~filters.COMMAND), receive_payment_photo))
 
-    # Admin broadcast and order flow messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=2)
+    # Text messages
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
-    app.add_error_handler(error_handler)
-
-    logger.info("Bot started.")
+    print("✅ UCstore бот фаъол шуд!")
     app.run_polling()
 
 
